@@ -555,9 +555,9 @@ impl Gatherer {
         //
         // 1. User overrides - If the user specifies the license expression and
         // the constraints for the package still match the current one being checked
-        // 2. Overlay overrides - If the user has specified an overlay, and it contains
-        // information for the crate and the constraints for the package still
-        // match the current one being checked
+        // 2. Clearly defined - If the package has license information from
+        // clearlydefined.io, we consider that more likely to be "correct",
+        // particularly for crates which include "external" C/C++ code
         // 3. `license`
         // 4. `license-file` + all LICENSE(-*)? files - Due to the prevalance
         // of dual-licensing in the rust ecosystem, many people forgo setting
