@@ -467,6 +467,107 @@ impl Default for LicenseStore {
     }
 }
 
+#[derive(Debug)]
+struct CDDef<'a> {
+    /// The id of the crate for the definition
+    id: &'a crate::Kid,
+    /// The (usually) SPDX expression that clearly defined thinks the crate uses
+    declared: String,
+    /// The individual (usually) SPDX license identifiers that were actually discovered
+    discovered: Vec<String>,
+}
+
+/// Attempts to retrieve licensing terms for every (remote) crate from
+/// clearlydefined.io, returning a sorted (by package id) list of definitions
+/// actually found, excluding crates that haven't been harvested
+fn get_clearly_defined<'k>(krates: &'k crate::Krates) -> Vec<CDDef<'k>> {
+    let mut cded: Vec<CDDef<'_>> = Vec::with_capacity(krates.len());
+
+    #[cfg(feature = "clearly-defined")]
+    {
+        let client = cd::client::Client::new();
+
+        for response in cd::definitions::get(krates.krates().filter_map(|k| {
+            let k = &k.krate;
+
+            // Ignore crates that have a non-github/crates.io source
+            if let Some(src) = &k.source {
+                let (shape, provider, ns) = if src.is_default_registry() {
+                    (cd::Shape::Crate, cd::Provider::CratesIo, None)
+                } else if src.is_git() && src.url().host() == Some(url::Host::Domain("github.com")) {
+                    // _should_ be `/<org>/<repo>`
+                    let path = &src.url().path()[1..];
+                    match path.find('/') {
+                        Some(ind) => {
+                            (cd::Shape::Git, cd::Provider::Github, Some((&path[..ind]).to_owned()))
+                        }
+                        None => {
+                            log::warn!("crate '{}' uses malformed github URL '{}'", k.id, src.url());
+                            return None;
+                        }
+                    }
+                } else {
+                    // TODO: support alternative registries in a possible future
+                    // where clearlydefined supports them, but for now just
+                    // log that we found it and move on
+                    log::warn!("crate '{}' is sourced from a location incompatible with clearlydefined.io and will be ignored", k.id);
+                    return None;
+                };
+
+                return Some(cd::Coordinate {
+                    shape,
+                    provider,
+                    namespace: ns,
+                    name: k.name.clone(),
+                    version: cd::CoordVersion::Semver(k.version.clone()),
+                    // TODO: Support curation PRs configured by the user?
+                    curation_pr: None,
+                });
+            }
+
+            None
+        })).flat_map(|req| {
+            client.execute(req).into_iter().map(|res: cd::definitions::GetResponse| {
+                res.definitions.into_iter()
+                    .filter_map(|def| {
+                        // Map the coordinate of the component back to the krate id
+                        krates.krates_by_name(&def.coordinates.name).find(|(_, node)| {
+                            let version_match = match &def.coordinates.revision {
+                                cd::CoordVersion::Semver(semver) => {
+                                    semver == &node.krate.version
+                                }
+                                // Just in case, but we should never have an invalid semver version
+                                cd::CoordVersion::Any(s) => {
+                                    s == &format!("{}", node.krate.version)
+                                }
+                            };
+
+                            match &node.krate.source {
+                                Some(src) => {
+                                    version_match && (def.coordinates.provider == cd::Provider::CratesIo && src.is_default_registry() || def.coordinates.provider == cd::Provider::Github && src.is_git() && src.url().host() == Some(url::Host::Domain("github.com")))
+                                }
+                                None => false,
+                            }
+                        }).and_then(|(_, node)| {
+                            def.licensed.map(|lic| {
+                                CDDef {
+                                    id: &node.krate.id,
+                                    declared: lic.declared,
+                                    discovered: lic.facets.core.discovered.expressions,
+                                }
+                            })
+                        })
+                    })
+            })
+        }) {
+            cded.extend(response.into_iter());
+        }
+    }
+
+    cded.sort_by_key(|cd: &CDDef<'_>| cd.id);
+    cded
+}
+
 pub struct Gatherer {
     store: Arc<LicenseStore>,
     threshold: f32,
@@ -524,6 +625,9 @@ impl Gatherer {
     ) -> Summary<'k> {
         let mut summary = Summary::new(self.store);
 
+        // Get license definitions from clearlydefined.io
+        let cded = get_clearly_defined(krates);
+
         let threshold = self.threshold;
 
         let strategy = askalono::ScanStrategy::new(&summary.store.store)
@@ -531,98 +635,6 @@ impl Gatherer {
             .confidence_threshold(0.5)
             .optimize(false)
             .max_passes(1);
-
-        // Do request(s) to gather all of the license info from clearlydefined at once rather
-        // than for each individual package
-        let mut cded: Vec<CDDef<'_>> = Vec::with_capacity(krates.len());
-
-        #[derive(Debug)]
-        struct CDDef<'a> {
-            id: &'a crate::Kid,
-            expr: String,
-        }
-
-        #[cfg(feature = "clearly-defined")]
-        {
-            let client = cd::client::Client::new();
-
-            for response in cd::definitions::get(krates.krates().filter_map(|k| {
-                let k = &k.krate;
-
-                // Ignore crates that have a non-github/crates.io source
-                if let Some(src) = &k.source {
-                    let (shape, provider, ns) = if src.is_default_registry() {
-                        (cd::Shape::Crate, cd::Provider::CratesIo, None)
-                    } else if src.is_git() && src.url().host() == Some(url::Host::Domain("github.com")) {
-                        // _should_ be `/<org>/<repo>`
-                        let path = &src.url().path()[1..];
-                        match path.find('/') {
-                            Some(ind) => {
-                                (cd::Shape::Git, cd::Provider::Github, Some((&path[..ind]).to_owned()))
-                            }
-                            None => {
-                                log::warn!("crate '{}' uses malformed github URL '{}'", k.id, src.url());
-                                return None;
-                            }
-                        }
-                    } else {
-                        // TODO: support alternative registries in a possible future
-                        // where clearlydefined supports them, but for now just
-                        // log that we found it and move on
-                        log::warn!("crate '{}' is sourced from a location incompatible with clearlydefined.io and will be ignored", k.id);
-                        return None;
-                    };
-
-                    return Some(cd::Coordinate {
-                        shape,
-                        provider,
-                        namespace: ns,
-                        name: k.name.clone(),
-                        version: cd::CoordVersion::Semver(k.version.clone()),
-                        // TODO: Support curation PRs configured by the user?
-                        curation_pr: None,
-                    });
-                }
-
-                None
-            })).flat_map(|req| {
-                client.execute(req).into_iter().map(|res: cd::definitions::GetResponse| {
-                    res.definitions.into_iter()
-                        .filter_map(|def| {
-                            // Map the coordinate of the component back to the krate id
-                            krates.krates_by_name(&def.coordinates.name).find(|(_, node)| {
-                                let version_match = match &def.coordinates.revision {
-                                    cd::CoordVersion::Semver(semver) => {
-                                        semver == &node.krate.version
-                                    }
-                                    // Just in case, but we should never have an invalid semver version
-                                    cd::CoordVersion::Any(s) => {
-                                        s == &format!("{}", node.krate.version)
-                                    }
-                                };
-
-                                match &node.krate.source {
-                                    Some(src) => {
-                                        version_match && (def.coordinates.provider == cd::Provider::CratesIo && src.is_default_registry() || def.coordinates.provider == cd::Provider::Github && src.is_git() && src.url().host() == Some(url::Host::Domain("github.com")))
-                                    }
-                                    None => false,
-                                }
-                            }).and_then(|(_, node)| {
-                                def.licensed.map(|lic| {
-                                    CDDef {
-                                        id: &node.krate.id,
-                                        expr: lic.declared,
-                                    }
-                                })
-                            })
-                        })
-                })
-            }) {
-                cded.extend(response.into_iter());
-            }
-        }
-
-        cded.sort_by_key(|cd: &CDDef<'_>| cd.id);
 
         let files_lock = std::sync::Arc::new(std::sync::RwLock::new(files));
 
@@ -688,7 +700,7 @@ impl Gatherer {
                                 krate.name,
                                 krate.version,
                                 krate.license.as_deref().unwrap_or_default(),
-                                clearly_defed.as_ref().map(|cd| cd.expr.as_str()).unwrap_or(""),
+                                clearly_defed.as_ref().map(|cd| cd.declared.as_str()).unwrap_or(""),
                             );
 
                             {
@@ -750,6 +762,10 @@ impl Gatherer {
                             Ok(validated) => {
                                 let (id, span) = get_span("license");
 
+                                // TODO: Check if the crate has been harvested in clearlydefined.io, and ensure
+                                // that the discovered licenses match the licenses in the expression, if they don't
+                                // notify the user
+
                                 return KrateLicense {
                                     krate,
                                     lic_info: LicenseInfo::SPDXExpression {
@@ -785,8 +801,8 @@ impl Gatherer {
                 // 3
                 if let Some(clearly_defed) = clearly_defed {
                     // Use relaxed parsing rules for SPDX expressions from clearlydefined, as, for example
-                    // there is
-                    match spdx::Expression::parse_mode(&clearly_defed.expr, spdx::ParseMode::Lax) {
+                    // there "may" be some non-valid license identifiers in the harvested data
+                    match spdx::Expression::parse_mode(&clearly_defed.declared, spdx::ParseMode::Lax) {
                         Ok(expr) => {
                             let (id, span) = get_span("cd-license");
 
