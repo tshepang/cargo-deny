@@ -24,7 +24,7 @@ license check
 ### The `allow` and `deny` fields (optional)
 
 The licenses that should be allowed or denied. The license must be a valid SPDX 
-v2.1 identifier, which must either be in version 3.7 of the 
+v2.1 identifier, which must either be in version 3.8 of the 
 [SPDX License List](https://spdx.org/licenses/), with an optional 
 [exception](https://spdx.org/licenses/exceptions-index.html) specified by 
 `WITH <exception-id>`, or else a user defined license reference denoted by 
@@ -106,7 +106,7 @@ might not fail if the expression still evaluates to true
 Determines what happens when licenses aren't explicitly allowed or denied, but 
 **are** marked as [OSI Approved](https://opensource.org/licenses) or 
 [FSF Free/Libre](https://www.gnu.org/licenses/license-list.en.html) in version
-3.7 of the [SPDX License List](https://spdx.org/licenses/).
+3.8 of the [SPDX License List](https://spdx.org/licenses/).
 
 * `both` - The license is accepted if it is both OSI approved and FSF Free
 * `either` - The license is accepted if it is either OSI approved or FSF Free

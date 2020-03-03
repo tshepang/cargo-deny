@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Changed
+- Upgraded `spdx`, version 3.8 of the SPDX license list is now supported.
+
 ## [0.6.6] - 2020-02-25
 ### Changed
 - Updated crates. Mainly to force a new version because the Windows release messed up. Yay!
