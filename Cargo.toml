@@ -24,8 +24,9 @@ name = "cargo-deny"
 path = "src/cargo-deny/main.rs"
 
 [features]
-default = ["vendored-openssl"]
+default = ["vendored-openssl", "clearly-defined"]
 vendored-openssl = ["rustsec/vendored-openssl"]
+clearly-defined = ["cd"]
 
 [dependencies]
 ansi_term = "0.12.1"
@@ -33,7 +34,6 @@ anyhow = "1.0.25"
 askalono = "0.4.1"
 atty = "0.2.13"
 bitvec = { version = "0.17.1", features = ["alloc"] }
-cd = { path = "../clearly-defined" }
 chrono = "0.4.10"
 clap = "2.33.0"
 codespan = "0.8.0"
@@ -57,6 +57,13 @@ toml = "0.5.5"
 twox-hash = { version = "1.5.0", default-features = false }
 url = "2.1.0"
 rustsec = "0.18.0"
+
+[dependencies.cd]
+optional = true
+#path = "../clearly-defined"
+git = "https://github.com/EmbarkStudios/clearly-defined"
+branch = "impl"
+features = ["blocking", "rustls"]
 
 [dev-dependencies]
 # We use this for pretty printing errors

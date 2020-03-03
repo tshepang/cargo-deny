@@ -212,13 +212,12 @@ impl From<cm::Package> for Krate {
             },
             targets: pkg.targets,
             license: pkg.license.map(|lf| {
-                // cargo used to allow / in place of OR which is not valid
-                // in SPDX expression, we force correct it here
-                if lf.contains('/') {
-                    lf.replace('/', " OR ")
-                } else {
-                    lf
-                }
+                // Instead of correcting the license, we'll just use lax parsing
+                // for the SPDX expression. We need to keep the original so that
+                // we know if the expression contained a /, as we need to workaround
+                // a bug in clearlydefined.io where / was interpreted as an AND
+                // rather than an OR
+                lf
             }),
             license_file: pkg.license_file,
             description: pkg.description,
@@ -275,16 +274,15 @@ where
 #[inline]
 pub fn hash(data: &[u8]) -> u32 {
     use std::hash::Hasher;
-    // We use the 32-bit hash instead of the 64 even though
-    // it is significantly slower due to the TOML limitation
-    // if only supporting i64
+    // We use the 32-bit hash instead of the 64 even though it is significantly
+    // slower due to the TOML limitation of only supporting i64
     let mut xx = twox_hash::XxHash32::default();
     xx.write(data);
     xx.finish() as u32
 }
 
-/// Common context for the various checks. Some checks
-/// require additional information though.
+/// Common context for the various checks. Some checks require additional
+/// information though.
 pub struct CheckCtx<'ctx, T> {
     /// The configuration for the check
     pub cfg: T,

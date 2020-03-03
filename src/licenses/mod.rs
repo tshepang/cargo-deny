@@ -402,8 +402,8 @@ pub enum LicenseExprSource {
     Metadata,
     /// An override in the user's deny.toml
     UserOverride,
-    /// An override from an overlay
-    OverlayOverride,
+    /// The expression was found by querying clearlydefined.io
+    ClearlyDefined,
     /// An expression synthesized from one or more LICENSE files
     LicenseFiles,
 }
@@ -532,6 +532,98 @@ impl Gatherer {
             .optimize(false)
             .max_passes(1);
 
+        // Do request(s) to gather all of the license info from clearlydefined at once rather
+        // than for each individual package
+        let mut cded: Vec<CDDef<'_>> = Vec::with_capacity(krates.len());
+
+        #[derive(Debug)]
+        struct CDDef<'a> {
+            id: &'a crate::Kid,
+            expr: String,
+        }
+
+        #[cfg(feature = "clearly-defined")]
+        {
+            let client = cd::client::Client::new();
+
+            for response in cd::definitions::get(krates.krates().filter_map(|k| {
+                let k = &k.krate;
+
+                // Ignore crates that have a non-github/crates.io source
+                if let Some(src) = &k.source {
+                    let (shape, provider, ns) = if src.is_default_registry() {
+                        (cd::Shape::Crate, cd::Provider::CratesIo, None)
+                    } else if src.is_git() && src.url().host() == Some(url::Host::Domain("github.com")) {
+                        // _should_ be `/<org>/<repo>`
+                        let path = &src.url().path()[1..];
+                        match path.find('/') {
+                            Some(ind) => {
+                                (cd::Shape::Git, cd::Provider::Github, Some((&path[..ind]).to_owned()))
+                            }
+                            None => {
+                                log::warn!("crate '{}' uses malformed github URL '{}'", k.id, src.url());
+                                return None;
+                            }
+                        }
+                    } else {
+                        // TODO: support alternative registries in a possible future
+                        // where clearlydefined supports them, but for now just
+                        // log that we found it and move on
+                        log::warn!("crate '{}' is sourced from a location incompatible with clearlydefined.io and will be ignored", k.id);
+                        return None;
+                    };
+
+                    return Some(cd::Coordinate {
+                        shape,
+                        provider,
+                        namespace: ns,
+                        name: k.name.clone(),
+                        version: cd::CoordVersion::Semver(k.version.clone()),
+                        // TODO: Support curation PRs configured by the user?
+                        curation_pr: None,
+                    });
+                }
+
+                None
+            })).flat_map(|req| {
+                client.execute(req).into_iter().map(|res: cd::definitions::GetResponse| {
+                    res.definitions.into_iter()
+                        .filter_map(|def| {
+                            // Map the coordinate of the component back to the krate id
+                            krates.krates_by_name(&def.coordinates.name).find(|(_, node)| {
+                                let version_match = match &def.coordinates.revision {
+                                    cd::CoordVersion::Semver(semver) => {
+                                        semver == &node.krate.version
+                                    }
+                                    // Just in case, but we should never have an invalid semver version
+                                    cd::CoordVersion::Any(s) => {
+                                        s == &format!("{}", node.krate.version)
+                                    }
+                                };
+
+                                match &node.krate.source {
+                                    Some(src) => {
+                                        version_match && (def.coordinates.provider == cd::Provider::CratesIo && src.is_default_registry() || def.coordinates.provider == cd::Provider::Github && src.is_git() && src.url().host() == Some(url::Host::Domain("github.com")))
+                                    }
+                                    None => false,
+                                }
+                            }).and_then(|(_, node)| {
+                                def.licensed.map(|lic| {
+                                    CDDef {
+                                        id: &node.krate.id,
+                                        expr: lic.declared,
+                                    }
+                                })
+                            })
+                        })
+                })
+            }) {
+                cded.extend(response.into_iter());
+            }
+        }
+
+        cded.sort_by_key(|cd: &CDDef<'_>| cd.id);
+
         let files_lock = std::sync::Arc::new(std::sync::RwLock::new(files));
 
         // Retrieve the license expression we'll use to evaluate the user's overall
@@ -555,10 +647,15 @@ impl Gatherer {
         //
         // 1. User overrides - If the user specifies the license expression and
         // the constraints for the package still match the current one being checked
-        // 2. Clearly defined - If the package has license information from
+        // 2. `license`
+        // 3. Clearly defined - If the package has license information from
         // clearlydefined.io, we consider that more likely to be "correct",
-        // particularly for crates which include "external" C/C++ code
-        // 3. `license`
+        // particularly for crates which include "external" C/C++ code. Note that
+        // eventually this may move to #2, but right now most crates, and especially
+        // most crate versions are not available in clearlydefined, and there are
+        // also a few issues with the clearlydefined scanning, eg. `Apache-2.0/MIT`
+        // is interpreted as `Apache-2.0 AND MIT`, but as the database fleshes
+        // out crates it _should_ serve as a better source of truth, generally
         // 4. `license-file` + all LICENSE(-*)? files - Due to the prevalance
         // of dual-licensing in the rust ecosystem, many people forgo setting
         // license-file, so we use it and/or any LICENSE files
@@ -567,6 +664,9 @@ impl Gatherer {
             .par_bridge()
             .map(|kn| {
                 let krate = &kn.krate;
+
+                // Lookup the expression we got from clearly defined, if any
+                let clearly_defed = cded.binary_search_by(|cd: &CDDef<'_>| cd.id.cmp(&krate.id)).map(|ind| &cded[ind]).ok();
 
                 // Attempt an SPDX expression that we can validate the user's acceptable
                 // license terms with
@@ -584,10 +684,11 @@ impl Gatherer {
                             // Synthesize a minimal Cargo.toml for reporting diagnostics
                             // for where we retrieved license stuff
                             let synth_manifest = format!(
-                                "[package]\nname = \"{}\"\nversion = \"{}\"\nlicense = \"{}\"\n",
+                                "[package]\nname = \"{}\"\nversion = \"{}\"\nlicense = \"{}\"\ncd-license = \"{}\"\n",
                                 krate.name,
                                 krate.version,
                                 krate.license.as_deref().unwrap_or_default(),
+                                clearly_defed.as_ref().map(|cd| cd.expr.as_str()).unwrap_or(""),
                             );
 
                             {
@@ -615,10 +716,6 @@ impl Gatherer {
                             }
                         };
 
-                        // pub name: String,
-                        // pub version: VersionReq,
-                        // pub expression: spdx::Expression,
-                        // pub license_files: Vec<FileSource>,
                         // Check to see if the clarification provided exactly matches
                         // the set of detected licenses, if they do, we use the clarification's
                         // license expression as the license requirement's for this crate
@@ -639,9 +736,7 @@ impl Gatherer {
                     }
                 }
 
-                // 2 TODO
-
-                // 3
+                // 2
                 match &krate.license {
                     Some(license_field) => {
                         // Reasons this can fail:
@@ -650,7 +745,8 @@ impl Gatherer {
                         // * It also just does basic lexing, so parens, duplicate operators,
                         // unpaired exceptions etc can all fail validation
 
-                        match spdx::Expression::parse(license_field) {
+                        // We use lax parsing here to handle eg / and so forth
+                        match spdx::Expression::parse_mode(license_field, spdx::ParseMode::Lax) {
                             Ok(validated) => {
                                 let (id, span) = get_span("license");
 
@@ -683,6 +779,37 @@ impl Gatherer {
                             lic_span,
                             "license expression was not specified",
                         ));
+                    }
+                }
+
+                // 3
+                if let Some(clearly_defed) = clearly_defed {
+                    // Use relaxed parsing rules for SPDX expressions from clearlydefined, as, for example
+                    // there is
+                    match spdx::Expression::parse_mode(&clearly_defed.expr, spdx::ParseMode::Lax) {
+                        Ok(expr) => {
+                            let (id, span) = get_span("cd-license");
+
+                            return KrateLicense {
+                                krate,
+                                lic_info: LicenseInfo::SPDXExpression {
+                                    expr,
+                                    nfo: LicenseExprInfo {
+                                        file_id: id,
+                                        offset: span.start,
+                                        source: LicenseExprSource::ClearlyDefined,
+                                    },
+                                },
+                                labels,
+                            };
+                        }
+                        Err(err) => {
+                            let (id, lic_span) = get_span("cd-license");
+                                let lic_span = lic_span.start + err.span.start as u32
+                                    ..lic_span.start + err.span.end as u32;
+
+                            labels.push(Label::new(id, lic_span, format!("failed to parse SPDX expression from clearlydefined.io: {}", err.reason)));
+                        }
                     }
                 }
 
@@ -961,7 +1088,7 @@ fn evaluate_expression(
                 LicenseExprSource::Metadata => "Cargo.toml `license`",
                 LicenseExprSource::UserOverride => "user override",
                 LicenseExprSource::LicenseFiles => "LICENSE file(s)",
-                LicenseExprSource::OverlayOverride => unreachable!(),
+                LicenseExprSource::ClearlyDefined => "clearlydefined.io",
             }
         ),
     );
