@@ -10,6 +10,9 @@ targets = [
 vulnerability = "deny"
 unmaintained = "deny"
 notice = "deny"
+ignore = [
+    "RUSTSEC-2019-0031",
+]
 
 [bans]
 multiple-versions = "deny"
