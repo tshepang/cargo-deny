@@ -10,8 +10,6 @@
 //! requirements that are satisfied by the licenses you choose to use for your
 //! project, and notifies you via warnings or errors if the license requirements
 //! for any crate aren't compatible with your configuration.
-//!
-//!
 
 /// Configuration for license checking
 pub mod cfg;
@@ -560,7 +558,7 @@ fn get_clearly_defined<'k>(krates: &'k crate::Krates) -> Vec<CDDef<'k>> {
                     })
             })
         }) {
-            cded.extend(response.into_iter());
+            cded.extend(response);
         }
     }
 
